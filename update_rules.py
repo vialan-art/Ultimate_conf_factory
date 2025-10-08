@@ -32,52 +32,65 @@ def fetch_content(url):
     return None
 
 def process_rule_files():
-    """处理所有规则列表文件，区分为预设格式规则和待展开URL"""
-    pre_formatted_rules = []
+    """
+    读取所有 .txt 文件，并将每一行分类为：
+    1. 预设格式的规则集 (RULE-SET/DOMAIN-SET)
+    2. 需要展开的 URL
+    3. 直接写入的原生规则
+    """
+    pre_formatted_rule_sets = []
     urls_to_expand = {"REJECT": [], "PROXY": [], "DIRECT": []}
+    raw_rules = {"REJECT": [], "PROXY": [], "DIRECT": []}
+
     for policy, filepath in RULE_LISTS.items():
         if not os.path.exists(filepath): continue
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        print(f"\n--- Reading {filepath} ---")
+        
+        print(f"\n--- Reading {filepath} (for {policy} policy) ---")
         for line in lines:
-            if ',' in line and ('RULE-SET' in line or 'DOMAIN-SET' in line):
-                print(f"Found pre-formatted rule: {line}")
-                pre_formatted_rules.append(line)
-            else:
-                print(f"Found URL to expand: {line}")
+            if line.startswith('http'):
+                print(f"Found URL: {line}")
                 urls_to_expand[policy].append(line)
-    return pre_formatted_rules, urls_to_expand
+            elif 'RULE-SET' in line or 'DOMAIN-SET' in line:
+                print(f"Found pre-formatted Rule-Set: {line}")
+                pre_formatted_rule_sets.append(line)
+            else: # 这是一个原生规则
+                print(f"Found raw rule: {line}")
+                raw_rules[policy].append(line)
 
-def expand_and_process_urls(urls_to_expand):
+    return pre_formatted_rule_sets, urls_to_expand, raw_rules
+
+def expand_and_process_rules(urls_to_expand, raw_rules):
     """
-    展开URL，并根据“小规则优先”原则处理每一条规则。
+    展开URL，与原生规则合并，并根据“小规则优先”原则应用策略。
     """
-    all_generated_rules = []
-    for default_policy, urls in urls_to_expand.items():
-        if not urls: continue
-        print(f"\n--- Expanding rules from {default_policy} lists ---")
-        for url in urls:
-            content = fetch_content(url)
-            if content:
-                count = 0
-                for rule_line in content.splitlines():
-                    rule = rule_line.strip().split('#', 1)[0].strip()
-                    if not rule: continue
-                    
-                    parts = {p.strip() for p in rule.split(',')}
-                    
-                    # 检查规则是否包含“小规则”
-                    if any(p in KNOWN_POLICIES_OPTIONS for p in parts):
-                        # 包含，则直接使用原规则
-                        all_generated_rules.append(rule)
-                    else:
-                        # 不包含，则应用“大规则”
-                        all_generated_rules.append(f"{rule},{default_policy}")
-                    
-                    count += 1
-                print(f"-> Processed {count} rules from {url}")
-    return all_generated_rules
+    all_processed_rules = []
+
+    for default_policy in ['REJECT', 'PROXY', 'DIRECT']:
+        # 集合所有待处理的规则行（原生的 + URL下载的）
+        rules_to_process = raw_rules.get(default_policy, [])
+        
+        urls = urls_to_expand.get(default_policy, [])
+        if urls:
+            print(f"\n--- Expanding rules for {default_policy} policy ---")
+            for url in urls:
+                content = fetch_content(url)
+                if content:
+                    fetched_lines = [line.strip().split('#', 1)[0].strip() for line in content.splitlines()]
+                    rules_to_process.extend(line for line in fetched_lines if line)
+                    print(f"-> Fetched {len(fetched_lines)} lines from {url}")
+        
+        # 统一处理
+        for rule in rules_to_process:
+            parts = {p.strip() for p in rule.split(',')}
+            if any(p in KNOWN_POLICIES_OPTIONS for p in parts):
+                all_processed_rules.append(rule)
+            else:
+                all_processed_rules.append(f"{rule},{default_policy}")
+                
+    print(f"\nTotal of {len(all_processed_rules)} rules processed.")
+    return all_processed_rules
 
 def is_reject_like(line):
     """判断一行规则是否属于“拒绝类”"""
@@ -85,20 +98,20 @@ def is_reject_like(line):
     return ',REJECT' in clean_line or ',no-resolve' in clean_line
 
 def classify_rules(rules):
-    """将所有生成好的规则分类到 REJECT, PROXY, DIRECT 三个组"""
-    reject_list, proxy_list, direct_list = [], [], []
+    """将所有处理好的规则分类"""
+    classified = {"REJECT": [], "PROXY": [], "DIRECT": []}
     for rule in rules:
         if is_reject_like(rule):
-            reject_list.append(rule)
+            classified["REJECT"].append(rule)
         elif ",PROXY" in rule:
-            proxy_list.append(rule)
+            classified["PROXY"].append(rule)
         elif ",DIRECT" in rule:
-            direct_list.append(rule)
+            classified["DIRECT"].append(rule)
     
     result = {}
-    if reject_list: result["REJECT"] = "\n# Expanded REJECT-like rules\n" + "\n".join(reject_list)
-    if proxy_list: result["PROXY"] = "\n# Expanded PROXY rules\n" + "\n".join(proxy_list)
-    if direct_list: result["DIRECT"] = "\n# Expanded DIRECT rules\n" + "\n".join(direct_list)
+    if classified["REJECT"]: result["REJECT"] = "\n# Expanded REJECT-like rules\n" + "\n".join(classified["REJECT"])
+    if classified["PROXY"]: result["PROXY"] = "\n# Expanded PROXY rules\n" + "\n".join(classified["PROXY"])
+    if classified["DIRECT"]: result["DIRECT"] = "\n# Expanded DIRECT rules\n" + "\n".join(classified["DIRECT"])
     return result
 
 def find_best_insertion_point(lines, policy):
@@ -114,8 +127,7 @@ def find_best_insertion_point(lines, policy):
         print(f"Info: No base rules found for {policy}. Cannot determine best insertion point.")
         return None
 
-    best_index = -1
-    max_density = -1
+    best_index, max_density = -1, -1
 
     for i in candidate_indices:
         start, end = max(0, i - VALIDATION_WINDOW), min(len(lines), i + VALIDATION_WINDOW + 1)
@@ -127,17 +139,14 @@ def find_best_insertion_point(lines, policy):
         
         density = count / (end - start)
         
-        # 找到密度最高的区域，并记录该区域的最后一个候选点
         if density >= max_density:
-            max_density = density
-            best_index = i
+            max_density, best_index = density, i
             
     if best_index != -1:
         print(f"Found best insertion point for {policy} at line {best_index + 1} with density {max_density:.2%}")
         return best_index + 1
     
     return None
-
 
 def find_last_line_contains(lines, text):
     """从后往前查找包含特定文本的行索引"""
@@ -152,36 +161,29 @@ def main():
 
     config_lines = base_config_content.splitlines()
 
-    pre_formatted_rules, urls_to_expand = process_rule_files()
-    all_generated_rules = expand_and_process_urls(urls_to_expand)
-    expanded_rules = classify_rules(all_generated_rules)
+    pre_formatted, urls, raws = process_rule_files()
+    all_generated = expand_and_process_rules(urls, raws)
+    expanded_rules = classify_rules(all_generated)
 
     # --- 智能插入逻辑 ---
     if expanded_rules.get("DIRECT"):
         idx = find_last_line_contains(config_lines, "GEOIP,")
-        if idx != -1:
-            print(f"\nInserting expanded DIRECT rules before last GEOIP rule (line {idx + 1})...")
-            config_lines.insert(idx, expanded_rules["DIRECT"] + "\n")
+        if idx != -1: config_lines.insert(idx, expanded_rules["DIRECT"] + "\n")
         else: print("\nCRITICAL: Last GEOIP rule not found. Skipping DIRECT rules insertion.")
 
     if expanded_rules.get("PROXY"):
         idx = find_best_insertion_point(config_lines, "PROXY")
-        if idx is not None:
-            print(f"Inserting expanded PROXY rules at line {idx + 1}...")
-            config_lines.insert(idx, expanded_rules["PROXY"])
+        if idx is not None: config_lines.insert(idx, expanded_rules["PROXY"])
 
     if expanded_rules.get("REJECT"):
         idx = find_best_insertion_point(config_lines, "REJECT")
-        if idx is not None:
-            print(f"Inserting expanded REJECT rules at line {idx + 1}...")
-            config_lines.insert(idx, expanded_rules["REJECT"])
+        if idx is not None: config_lines.insert(idx, expanded_rules["REJECT"])
     
-    if pre_formatted_rules:
+    if pre_formatted:
         idx = find_last_line_contains(config_lines, "[Rule]")
         if idx != -1:
-            print("Inserting pre-formatted rules at the top of [Rule] section...")
             header = "\n# Pre-formatted Rules (User-defined)\n"
-            config_lines.insert(idx + 1, header + "\n".join(pre_formatted_rules) + "\n")
+            config_lines.insert(idx + 1, header + "\n".join(pre_formatted) + "\n")
 
     # --- 文件生成 ---
     final_config_str = "\n".join(config_lines)
