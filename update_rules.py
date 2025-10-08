@@ -15,6 +15,9 @@ OUTPUT_FILE = "ultimate_edition.conf"
 VALIDATION_WINDOW = 25
 VALIDATION_THRESHOLD = 43 # 您的要求：超过85%
 
+# 已知的策略，用于判断规则是否完整
+KNOWN_POLICIES = {'REJECT', 'PROXY', 'DIRECT'}
+
 # --- 核心功能 ---
 
 def fetch_content(url):
@@ -48,7 +51,7 @@ def process_rule_files():
     return pre_formatted_rules, urls_to_expand
 
 def expand_urls(urls_to_expand):
-    """展开URL列表，生成普通规则"""
+    """展开URL列表，智能地格式化规则并添加策略"""
     expanded_rules = {"REJECT": "", "PROXY": "", "DIRECT": ""}
     for policy, urls in urls_to_expand.items():
         if not urls: continue
@@ -60,48 +63,67 @@ def expand_urls(urls_to_expand):
                 count = 0
                 for rule in content.splitlines():
                     rule = rule.strip().split('#', 1)[0].strip()
-                    if rule and len(rule.split(',')) >= 2:
-                        parts = rule.split(',')
-                        formatted_rule = f"{parts[0].strip()},{parts[1].strip()},{policy}"
-                        rules_for_policy.append(formatted_rule)
-                        count += 1
+                    if not rule or len(rule.split(',')) < 2: continue
+                    
+                    parts = [p.strip() for p in rule.split(',')]
+                    # 检查规则是否已经包含策略
+                    has_policy = any(p in KNOWN_POLICIES for p in parts)
+                    
+                    if has_policy:
+                        # 规则完整，直接使用
+                        rules_for_policy.append(rule)
+                    else:
+                        # 规则不完整，在第二个逗号后插入策略
+                        parts.insert(2, policy)
+                        new_rule = ",".join(parts)
+                        rules_for_policy.append(new_rule)
+                    count += 1
                 print(f"-> Expanded {url} into {count} rules.")
         if rules_for_policy:
             header = f"\n# Expanded rules for {policy}"
             expanded_rules[policy] = header + "\n" + "\n".join(rules_for_policy)
     return expanded_rules
 
+def is_reject_like(line):
+    """判断一行规则是否属于“拒绝类”"""
+    clean_line = line.strip()
+    return ',REJECT' in clean_line or ',no-resolve' in clean_line
+
 def find_insertion_point_with_validation(lines, policy):
-    """
-    使用上下文验证法寻找最佳插入点。
-    只有当找到密度>85%的区块时，才返回插入位置。否则返回None。
-    """
-    candidate_indices = [i for i, line in enumerate(lines) if line.strip().endswith(f',{policy}')]
+    """使用上下文验证法寻找最佳插入点"""
+    is_reject_check = policy == 'REJECT'
+    
+    # 根据策略类型选择判断函数和候选规则
+    if is_reject_check:
+        candidate_indices = [i for i, line in enumerate(lines) if is_reject_like(line)]
+    else: # PROXY
+        candidate_indices = [i for i, line in enumerate(lines) if line.strip().endswith(f',{policy}')]
+
     if not candidate_indices:
         print(f"Info: No base rules found for {policy}. Cannot insert.")
         return None
 
-    # 从后往前遍历所有候选位置，寻找第一个满足条件的区块
     for i in reversed(candidate_indices):
         start = max(0, i - VALIDATION_WINDOW)
         end = min(len(lines), i + VALIDATION_WINDOW + 1)
         
-        count = sum(1 for line in lines[start:end] if line.strip().endswith(f',{policy}'))
+        # 根据策略类型选择统计函数
+        if is_reject_check:
+            count = sum(1 for line in lines[start:end] if is_reject_like(line))
+        else:
+            count = sum(1 for line in lines[start:end] if line.strip().endswith(f',{policy}'))
         
-        # 核心逻辑：只有当密度满足严格要求时，才确认位置
         if count >= VALIDATION_THRESHOLD:
             print(f"Validation successful for {policy} at line {i + 1}. Density: {count}/{len(lines[start:end])} (>=85%)")
-            return i + 1  # 返回该行的下一行作为插入点
+            return i + 1
     
-    # 如果循环结束都没有找到满足条件的区块
-    print(f"CRITICAL: No rule block for '{policy}' passed the 85% density check. Skipping insertion to prevent errors.")
+    print(f"CRITICAL: No rule block for '{policy}' passed the 85% density check. Skipping insertion.")
     return None
 
 def find_last_line_contains(lines, text):
     """从后往前查找包含特定文本的行索引"""
     for i in range(len(lines) - 1, -1, -1):
-        if text in lines[i]:
-            return i
+        if text in lines[i]: return i
     return -1
 
 def main():
@@ -115,37 +137,32 @@ def main():
     expanded_rules = expand_urls(urls_to_expand)
 
     # --- 智能插入逻辑 ---
-
-    # 1. 插入 DIRECT 规则: 精准插入到最后一个 GEOIP 规则的上方
     if expanded_rules["DIRECT"]:
-        insertion_idx = find_last_line_contains(config_lines, "GEOIP,")
-        if insertion_idx != -1:
-            print(f"\nInserting expanded DIRECT rules before last GEOIP rule (line {insertion_idx + 1})...")
-            config_lines.insert(insertion_idx, expanded_rules["DIRECT"] + "\n")
+        idx = find_last_line_contains(config_lines, "GEOIP,")
+        if idx != -1:
+            print(f"\nInserting expanded DIRECT rules before last GEOIP rule (line {idx + 1})...")
+            config_lines.insert(idx, expanded_rules["DIRECT"] + "\n")
         else:
             print("\nCRITICAL: Last GEOIP rule not found. Skipping DIRECT rules insertion.")
 
-    # 2. 插入 PROXY 规则: 使用上下文验证法
     if expanded_rules["PROXY"]:
-        insertion_idx = find_insertion_point_with_validation(config_lines, "PROXY")
-        if insertion_idx is not None:
-            print(f"Inserting expanded PROXY rules at line {insertion_idx + 1}...")
-            config_lines.insert(insertion_idx, expanded_rules["PROXY"])
+        idx = find_insertion_point_with_validation(config_lines, "PROXY")
+        if idx is not None:
+            print(f"Inserting expanded PROXY rules at line {idx + 1}...")
+            config_lines.insert(idx, expanded_rules["PROXY"])
 
-    # 3. 插入 REJECT 规则: 使用上下文验证法
     if expanded_rules["REJECT"]:
-        insertion_idx = find_insertion_point_with_validation(config_lines, "REJECT")
-        if insertion_idx is not None:
-            print(f"Inserting expanded REJECT rules at line {insertion_idx + 1}...")
-            config_lines.insert(insertion_idx, expanded_rules["REJECT"])
+        idx = find_insertion_point_with_validation(config_lines, "REJECT")
+        if idx is not None:
+            print(f"Inserting expanded REJECT rules at line {idx + 1}...")
+            config_lines.insert(idx, expanded_rules["REJECT"])
     
-    # 4. 插入预设格式的规则: 插入到 [Rule] 标签的下方
     if pre_formatted_rules:
-        insertion_idx = find_last_line_contains(config_lines, "[Rule]")
-        if insertion_idx != -1:
+        idx = find_last_line_contains(config_lines, "[Rule]")
+        if idx != -1:
             print("Inserting pre-formatted rules at the top of [Rule] section...")
             header = "\n# Pre-formatted Rules (User-defined)\n"
-            config_lines.insert(insertion_idx + 1, header + "\n".join(pre_formatted_rules) + "\n")
+            config_lines.insert(idx + 1, header + "\n".join(pre_formatted_rules) + "\n")
 
     # --- 文件生成 ---
     final_config_str = "\n".join(config_lines)
