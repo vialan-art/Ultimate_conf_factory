@@ -11,9 +11,8 @@ RULE_LISTS = {
 }
 OUTPUT_FILE = "ultimate_edition.conf"
 
-# 上下文验证参数 (在50行窗口内，至少有43条同类规则，即超过85%)
+# 上下文分析窗口大小
 VALIDATION_WINDOW = 25
-VALIDATION_THRESHOLD = 43
 
 # 已知策略和特殊选项，用于判断规则是否自带“小规则”
 KNOWN_POLICIES_OPTIONS = {'REJECT', 'PROXY', 'DIRECT', 'no-resolve'}
@@ -102,20 +101,23 @@ def classify_rules(rules):
     if direct_list: result["DIRECT"] = "\n# Expanded DIRECT rules\n" + "\n".join(direct_list)
     return result
 
-def find_insertion_point_with_validation(lines, policy):
-    """使用上下文验证法寻找最佳插入点"""
+def find_best_insertion_point(lines, policy):
+    """通过计算所有候选点的密度，找到最优插入点"""
     is_reject_check = policy == 'REJECT'
     
     if is_reject_check:
         candidate_indices = [i for i, line in enumerate(lines) if is_reject_like(line)]
-    else:
+    else: # PROXY
         candidate_indices = [i for i, line in enumerate(lines) if line.strip().endswith(f',{policy}')]
 
     if not candidate_indices:
-        print(f"CRITICAL: No base rules found for {policy}. Skipping insertion.")
+        print(f"Info: No base rules found for {policy}. Cannot determine best insertion point.")
         return None
 
-    for i in reversed(candidate_indices):
+    best_index = -1
+    max_density = -1
+
+    for i in candidate_indices:
         start, end = max(0, i - VALIDATION_WINDOW), min(len(lines), i + VALIDATION_WINDOW + 1)
         
         if is_reject_check:
@@ -123,12 +125,19 @@ def find_insertion_point_with_validation(lines, policy):
         else:
             count = sum(1 for line in lines[start:end] if line.strip().endswith(f',{policy}'))
         
-        if count >= VALIDATION_THRESHOLD:
-            print(f"Validation successful for {policy} at line {i + 1}. Density: {count}/{end - start} (>=85%)")
-            return i + 1
+        density = count / (end - start)
+        
+        # 找到密度最高的区域，并记录该区域的最后一个候选点
+        if density >= max_density:
+            max_density = density
+            best_index = i
+            
+    if best_index != -1:
+        print(f"Found best insertion point for {policy} at line {best_index + 1} with density {max_density:.2%}")
+        return best_index + 1
     
-    print(f"CRITICAL: No rule block for '{policy}' passed the 85% density check. Skipping insertion.")
     return None
+
 
 def find_last_line_contains(lines, text):
     """从后往前查找包含特定文本的行索引"""
@@ -156,13 +165,13 @@ def main():
         else: print("\nCRITICAL: Last GEOIP rule not found. Skipping DIRECT rules insertion.")
 
     if expanded_rules.get("PROXY"):
-        idx = find_insertion_point_with_validation(config_lines, "PROXY")
+        idx = find_best_insertion_point(config_lines, "PROXY")
         if idx is not None:
             print(f"Inserting expanded PROXY rules at line {idx + 1}...")
             config_lines.insert(idx, expanded_rules["PROXY"])
 
     if expanded_rules.get("REJECT"):
-        idx = find_insertion_point_with_validation(config_lines, "REJECT")
+        idx = find_best_insertion_point(config_lines, "REJECT")
         if idx is not None:
             print(f"Inserting expanded REJECT rules at line {idx + 1}...")
             config_lines.insert(idx, expanded_rules["REJECT"])
