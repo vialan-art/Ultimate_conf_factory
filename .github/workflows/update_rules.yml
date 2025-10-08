@@ -1,42 +1,39 @@
 name: Update Shadowrocket Rules
 
 on:
-  # 允许手动触发
   workflow_dispatch:
-  # 设置定时任务，例如每天 UTC 时间 0 点执行一次
   schedule:
     - cron: '0 0 * * *'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
+    # --- 新增内容 ---
+    # 授予 Action 写入仓库内容的权限
+    permissions:
+      contents: write
+    # --- 新增内容结束 ---
 
     steps:
-      # 1. 检出你的仓库代码
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2. 设置 Python 环境
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
 
-      # 3. 安装脚本所需的依赖
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      # 4. 运行 Python 脚本来生成新的配置文件
       - name: Run rule update script
         run: python update_rules.py
 
-      # 5. 将生成的新配置文件提交回你的仓库
       - name: Commit and push if changed
         uses: stefanzweifel/git-auto-commit-action@v4
         with:
           commit_message: "chore: Auto-update Shadowrocket rules"
           file_pattern: ultimate_edition.conf
-          # 可选：如果你想推送到特定分支
-          # branch: main
