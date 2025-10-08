@@ -13,10 +13,7 @@ OUTPUT_FILE = "ultimate_edition.conf"
 
 # 上下文验证参数 (在50行窗口内，至少有43条同类规则，即超过85%)
 VALIDATION_WINDOW = 25
-VALIDATION_THRESHOLD = 43 # 您的要求：超过85%
-
-# 已知的策略，用于判断规则是否完整
-KNOWN_POLICIES = {'REJECT', 'PROXY', 'DIRECT'}
+VALIDATION_THRESHOLD = 43
 
 # --- 核心功能 ---
 
@@ -51,70 +48,84 @@ def process_rule_files():
     return pre_formatted_rules, urls_to_expand
 
 def expand_urls(urls_to_expand):
-    """展开URL列表，智能地格式化规则并添加策略"""
-    expanded_rules = {"REJECT": "", "PROXY": "", "DIRECT": ""}
-    for policy, urls in urls_to_expand.items():
+    """
+    展开URL。仅为不完整的(2段式)规则添加默认策略。
+    对于完整的(3段或以上)规则，保持原样。
+    """
+    all_generated_rules = []
+    for default_policy, urls in urls_to_expand.items():
         if not urls: continue
-        rules_for_policy = []
-        print(f"\n--- Expanding {policy} URLs ---")
+        print(f"\n--- Expanding rules from {default_policy} lists ---")
         for url in urls:
             content = fetch_content(url)
             if content:
                 count = 0
-                for rule in content.splitlines():
-                    rule = rule.strip().split('#', 1)[0].strip()
-                    if not rule or len(rule.split(',')) < 2: continue
+                for rule_line in content.splitlines():
+                    rule = rule_line.strip().split('#', 1)[0].strip()
+                    if not rule: continue
                     
                     parts = [p.strip() for p in rule.split(',')]
-                    # 检查规则是否已经包含策略
-                    has_policy = any(p in KNOWN_POLICIES for p in parts)
                     
-                    if has_policy:
-                        # 规则完整，直接使用
-                        rules_for_policy.append(rule)
-                    else:
-                        # 规则不完整，在第二个逗号后插入策略
-                        parts.insert(2, policy)
-                        new_rule = ",".join(parts)
-                        rules_for_policy.append(new_rule)
+                    # 规则只有2段(类型, 值)，是不完整的 -> 添加默认策略
+                    if len(parts) == 2:
+                        formatted_rule = f"{parts[0]},{parts[1]},{default_policy}"
+                        all_generated_rules.append(formatted_rule)
+                    # 规则有3段或以上，是完整的 -> 保持原样
+                    elif len(parts) > 2:
+                        all_generated_rules.append(rule)
+                    
                     count += 1
-                print(f"-> Expanded {url} into {count} rules.")
-        if rules_for_policy:
-            header = f"\n# Expanded rules for {policy}"
-            expanded_rules[policy] = header + "\n" + "\n".join(rules_for_policy)
-    return expanded_rules
+                print(f"-> Generated {count} rules from {url}")
+    return all_generated_rules
 
 def is_reject_like(line):
-    """判断一行规则是否属于“拒绝类”"""
+    """判断一行规则是否属于“拒绝类”(包含REJECT-*或no-resolve)"""
     clean_line = line.strip()
     return ',REJECT' in clean_line or ',no-resolve' in clean_line
+
+def classify_rules(rules):
+    """将所有生成好的规则分类到 REJECT, PROXY, DIRECT 三个组"""
+    reject_list, proxy_list, direct_list = [], [], []
+    for rule in rules:
+        if is_reject_like(rule):
+            reject_list.append(rule)
+        elif ",PROXY" in rule:
+            proxy_list.append(rule)
+        elif ",DIRECT" in rule:
+            direct_list.append(rule)
+    
+    result = {}
+    if reject_list:
+        result["REJECT"] = "\n# Expanded REJECT-like rules\n" + "\n".join(reject_list)
+    if proxy_list:
+        result["PROXY"] = "\n# Expanded PROXY rules\n" + "\n".join(proxy_list)
+    if direct_list:
+        result["DIRECT"] = "\n# Expanded DIRECT rules\n" + "\n".join(direct_list)
+    return result
 
 def find_insertion_point_with_validation(lines, policy):
     """使用上下文验证法寻找最佳插入点"""
     is_reject_check = policy == 'REJECT'
     
-    # 根据策略类型选择判断函数和候选规则
     if is_reject_check:
         candidate_indices = [i for i, line in enumerate(lines) if is_reject_like(line)]
-    else: # PROXY
+    else:
         candidate_indices = [i for i, line in enumerate(lines) if line.strip().endswith(f',{policy}')]
 
     if not candidate_indices:
-        print(f"Info: No base rules found for {policy}. Cannot insert.")
+        print(f"CRITICAL: No base rules found for {policy}. Skipping insertion.")
         return None
 
     for i in reversed(candidate_indices):
-        start = max(0, i - VALIDATION_WINDOW)
-        end = min(len(lines), i + VALIDATION_WINDOW + 1)
+        start, end = max(0, i - VALIDATION_WINDOW), min(len(lines), i + VALIDATION_WINDOW + 1)
         
-        # 根据策略类型选择统计函数
         if is_reject_check:
             count = sum(1 for line in lines[start:end] if is_reject_like(line))
         else:
             count = sum(1 for line in lines[start:end] if line.strip().endswith(f',{policy}'))
         
         if count >= VALIDATION_THRESHOLD:
-            print(f"Validation successful for {policy} at line {i + 1}. Density: {count}/{len(lines[start:end])} (>=85%)")
+            print(f"Validation successful for {policy} at line {i + 1}. Density: {count}/{end - start} (>=85%)")
             return i + 1
     
     print(f"CRITICAL: No rule block for '{policy}' passed the 85% density check. Skipping insertion.")
@@ -134,10 +145,11 @@ def main():
     config_lines = base_config_content.splitlines()
 
     pre_formatted_rules, urls_to_expand = process_rule_files()
-    expanded_rules = expand_urls(urls_to_expand)
+    all_generated_rules = expand_urls(urls_to_expand)
+    expanded_rules = classify_rules(all_generated_rules)
 
     # --- 智能插入逻辑 ---
-    if expanded_rules["DIRECT"]:
+    if expanded_rules.get("DIRECT"):
         idx = find_last_line_contains(config_lines, "GEOIP,")
         if idx != -1:
             print(f"\nInserting expanded DIRECT rules before last GEOIP rule (line {idx + 1})...")
@@ -145,13 +157,13 @@ def main():
         else:
             print("\nCRITICAL: Last GEOIP rule not found. Skipping DIRECT rules insertion.")
 
-    if expanded_rules["PROXY"]:
+    if expanded_rules.get("PROXY"):
         idx = find_insertion_point_with_validation(config_lines, "PROXY")
         if idx is not None:
             print(f"Inserting expanded PROXY rules at line {idx + 1}...")
             config_lines.insert(idx, expanded_rules["PROXY"])
 
-    if expanded_rules["REJECT"]:
+    if expanded_rules.get("REJECT"):
         idx = find_insertion_point_with_validation(config_lines, "REJECT")
         if idx is not None:
             print(f"Inserting expanded REJECT rules at line {idx + 1}...")
