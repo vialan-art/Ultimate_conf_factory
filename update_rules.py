@@ -1,6 +1,7 @@
 import requests
 import datetime
 import os
+import re
 
 # 定义基础配置文件的 URL
 BASE_CONFIG_URL = "https://raw.githubusercontent.com/Johnshall/Shadowrocket-ADBlock-Rules-Forever/release/sr_top500_whitelist_ad.conf"
@@ -18,8 +19,8 @@ OUTPUT_FILE = "ultimate_edition.conf"
 def fetch_content(url):
     """从 URL 获取文本内容"""
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()  # 如果请求失败则抛出异常
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
         return response.text
     except requests.RequestException as e:
         print(f"Error fetching {url}: {e}")
@@ -29,77 +30,111 @@ def process_rule_list(filepath, policy):
     """处理单个规则列表文件，返回带策略的规则字符串"""
     expanded_rules = []
     if not os.path.exists(filepath):
-        print(f"Warning: {filepath} not found. Skipping.")
+        print(f"Info: {filepath} not found. Skipping.")
         return ""
         
     with open(filepath, 'r') as f:
         urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
+    print(f"\n--- Processing {policy} rules from {filepath} ---")
     for url in urls:
-        print(f"Processing {url} for {policy} policy...")
+        print(f"Fetching rules from: {url}")
         content = fetch_content(url)
         if content:
             rules = content.splitlines()
+            count = 0
             for rule in rules:
                 rule = rule.strip()
                 if rule and not rule.startswith(('#', '[', '/')):
-                    # 移除可能的注释
                     if '#' in rule:
                         rule = rule.split('#', 1)[0].strip()
-                    # 确保规则不为空
                     if rule:
-                        # 格式化规则，移除可能存在的策略并添加指定的策略
                         parts = rule.split(',')
-                        # 假设规则格式为 DOMAIN-SUFFIX,example.com 或类似的格式
+                        # 兼容不同规则格式，只取类型和值
                         if len(parts) >= 2:
                             formatted_rule = f"{parts[0].strip()},{parts[1].strip()},{policy}"
                             expanded_rules.append(formatted_rule)
+                            count += 1
+            print(f"-> Added {count} rules.")
 
-    return "\n".join(expanded_rules)
+    if not expanded_rules:
+        return ""
+        
+    # 添加注释头并返回
+    header = f"\n# Custom rules for {policy} from {filepath}"
+    return header + "\n" + "\n".join(expanded_rules)
+
+def find_insertion_point(lines, patterns):
+    """在行列表中查找第一个匹配模式的行索引"""
+    for i, line in enumerate(lines):
+        # 跳过注释行
+        if line.strip().startswith('#'):
+            continue
+        for pattern in patterns:
+            # 使用正则表达式确保匹配的是策略，而不是域名中的一部分
+            if re.search(f".*,{pattern}$", line.strip()):
+                return i
+    return -1
 
 def main():
     print("Fetching base config...")
     base_config_content = fetch_content(BASE_CONFIG_URL)
     if not base_config_content:
-        print("Failed to fetch base config. Aborting.")
+        print("Fatal: Failed to fetch base config. Aborting.")
         return
 
-    # 按 REJECT, PROXY, DIRECT 的顺序处理规则
-    print("\nProcessing rule lists...")
+    config_lines = base_config_content.splitlines()
+
+    print("\nProcessing custom rule lists...")
     reject_rules = process_rule_list(RULE_LISTS["REJECT"], "REJECT")
     proxy_rules = process_rule_list(RULE_LISTS["PROXY"], "PROXY")
     direct_rules = process_rule_list(RULE_LISTS["DIRECT"], "DIRECT")
+
+    # --- 智能插入逻辑 (从文件底部往上插入，防止行号错乱) ---
+
+    # 1. 插入 DIRECT 规则
+    if direct_rules:
+        # 插入锚点：GEOIP,CN,DIRECT
+        insertion_idx = find_insertion_point(config_lines, ["GEOIP"])
+        if insertion_idx != -1:
+            print(f"\nInserting custom DIRECT rules before 'GEOIP,CN,DIRECT' (line {insertion_idx + 1})...")
+            config_lines.insert(insertion_idx, direct_rules)
+        else:
+            print("\nWarning: 'GEOIP,CN,DIRECT' marker not found. Cannot insert custom DIRECT rules.")
+
+    # 2. 插入 PROXY 规则
+    if proxy_rules:
+        # 插入锚点：第一个 DIRECT 规则
+        insertion_idx = find_insertion_point(config_lines, ["DIRECT"])
+        if insertion_idx != -1:
+            print(f"Inserting custom PROXY rules before the first DIRECT rule (line {insertion_idx + 1})...")
+            config_lines.insert(insertion_idx, proxy_rules)
+        else:
+            print("\nWarning: First DIRECT rule marker not found. Cannot insert custom PROXY rules.")
     
-    # 组合所有新规则
-    all_new_rules = "\n".join(filter(None, [
-        "# Custom Reject Rules", reject_rules,
-        "# Custom Proxy Rules", proxy_rules,
-        "# Custom Direct Rules", direct_rules
-    ]))
+    # 3. 插入 REJECT 规则
+    if reject_rules:
+        # 插入锚点：第一个 PROXY 规则
+        insertion_idx = find_insertion_point(config_lines, ["PROXY"])
+        if insertion_idx != -1:
+            print(f"Inserting custom REJECT rules before the first PROXY rule (line {insertion_idx + 1})...")
+            config_lines.insert(insertion_idx, reject_rules)
+        else:
+            print("\nWarning: First PROXY rule marker not found. Cannot insert custom REJECT rules.")
 
-    # 找到 [Rule] 标记的位置
-    rule_section_marker = "[Rule]"
-    marker_pos = base_config_content.find(rule_section_marker)
-
-    if marker_pos == -1:
-        print("Error: [Rule] section not found in base config. Aborting.")
-        return
-
-    # 在 [Rule] 下方插入新规则
-    insertion_pos = base_config_content.find('\n', marker_pos) + 1
-    final_config = (base_config_content[:insertion_pos] +
-                    all_new_rules + "\n\n" +
-                    base_config_content[insertion_pos:])
+    # 组合成最终配置
+    final_config_str = "\n".join(config_lines)
 
     # 更新配置文件顶部的构建时间
     build_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    final_config = f"# Ultimate Edition - Generated by GitHub Action\n# Build Time: {build_time}\n" + final_config
+    header = f"# Ultimate Edition - Generated by GitHub Action\n# Build Time: {build_time}\n"
+    final_config_str = header + final_config_str
 
     # 写入最终文件
-    with open(OUTPUT_FILE, 'w') as f:
-        f.write(final_config)
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        f.write(final_config_str)
         
-    print(f"\nSuccessfully created {OUTPUT_FILE}")
+    print(f"\n✅ Successfully created {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
